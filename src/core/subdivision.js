@@ -23,13 +23,37 @@
 import { buildTopology } from './topology.js';
 import {
   buildCreaseMap, classifyVertices, decaySharpness, normalizeCorners,
-  transitionWeight, RULE,
+  normalizeCreaseChains, transitionWeight, RULE,
 } from './creases.js';
 
 export const DEFAULT_OPTIONS = Object.freeze({
   boundaryMode: 'edgeAndCorner', // 'edgeAndCorner' | 'edgeOnly'
   validateEachLevel: true,
 });
+
+// Controlled-error injection for acceptance tests.  These are the two failure
+// modes the stroke regression must tell apart:
+//   WRONG_PARENT  child crease segments are filed under the wrong parent index.
+//                 Geometry is unchanged, so only the traced polyline breaks.
+//   WRONG_WEIGHT  sharp edge points use a skewed blend.  The polyline stays
+//                 connected but drifts off the engraved (limit) line.
+export const FAULT = Object.freeze({
+  NONE: 'none',
+  WRONG_PARENT: 'wrong-parent',
+  WRONG_WEIGHT: 'wrong-weight',
+  WRONG_INHERIT: 'wrong-inherit',
+});
+
+export function normalizeFault(fault) {
+  if (!fault) return FAULT.NONE;
+  if (typeof fault === 'string') {
+    const known = Object.values(FAULT);
+    if (known.includes(fault)) return fault;
+    throw new Error(`Unknown fault "${fault}"`);
+  }
+  if (Object.values(FAULT).includes(fault.mode)) return fault.mode;
+  return FAULT.NONE;
+}
 
 export function pinBoundaryCornersFromOptions(options) {
   return (options.boundaryMode || 'edgeAndCorner') !== 'edgeOnly';
@@ -45,6 +69,16 @@ function faceCentroid(positions, face) {
   return [x * inv, y * inv, z * inv];
 }
 
+// Level-0 segment directory in author order, so a tracer starts from the same
+// representation it gets at every refined level (segment i -> ordered halves).
+function controlChainSegments(chains) {
+  const out = new Map();
+  for (const c of chains) {
+    out.set(c.id, c.edges.map(([a, b]) => [{ key: edgeKeyOf(a, b), a, b }]));
+  }
+  return out;
+}
+
 /**
  * Create a level-0 object from a control mesh.
  */
@@ -54,6 +88,7 @@ export function createControlLevel(control, options = {}) {
   const faces = control.faces.map((f) => f.slice());
   const cornerSet = normalizeCorners(control.corners);
   const creaseMap = buildCreaseMap(control.creases, positions, opts);
+  const { chains, tags } = normalizeCreaseChains(control.creaseChains);
 
   const topology = buildTopology(positions, faces, { allowBoundary: true });
 
@@ -68,6 +103,28 @@ export function createControlLevel(control, options = {}) {
       );
       err.code = 'INVALID_CREASE';
       err.details = [{ a: c.a, b: c.b }];
+      throw err;
+    }
+  }
+  for (const key of tags.keys()) {
+    if (!topology.edgeIndexByKey.has(key)) {
+      const tag = tags.get(key);
+      const err = new Error(
+        `Crease chain "${tag.chainId}" segment ${tag.index} references edge ${key}, ` +
+        `which does not exist in the control mesh`
+      );
+      err.code = 'INVALID_CREASE_CHAIN';
+      err.details = [{ chainId: tag.chainId, index: tag.index, edge: key }];
+      throw err;
+    }
+    if (!creaseMap.has(key) && creaseMap.get(key) !== Infinity) {
+      const tag = tags.get(key);
+      const err = new Error(
+        `Crease chain "${tag.chainId}" segment ${tag.index} (edge ${key}) is not in the ` +
+        `crease list, so it would render as a smooth edge`
+      );
+      err.code = 'UNMATCHED_CREASE_CHAIN';
+      err.details = [{ chainId: tag.chainId, index: tag.index, edge: key }];
       throw err;
     }
   }
@@ -86,6 +143,9 @@ export function createControlLevel(control, options = {}) {
     faces,
     creaseMap,
     cornerSet,
+    creaseChains: chains,
+    creaseTags: tags,
+    creaseChainSegments: controlChainSegments(chains),
     options: opts,
     topology,
     rootVertexCount: positions.length,
@@ -105,6 +165,7 @@ export function subdivideLevel(level, optionsOverride = {}) {
   const { positions, faces, creaseMap, cornerSet } = level;
   const topology = level.topology || buildTopology(positions, faces, { allowBoundary: true });
   const pinCorners = pinBoundaryCornersFromOptions(opts);
+  const fault = normalizeFault(optionsOverride.fault || opts.fault);
 
   const V = positions.length;
   const F = faces.length;
@@ -130,6 +191,13 @@ export function subdivideLevel(level, optionsOverride = {}) {
   for (let f = 0; f < F; f++) faceCenters[f] = faceCentroid(positions, faces[f]);
 
   // --- per-edge parent/child sharpness -------------------------------------
+  // WRONG_INHERIT drops the crease on the *tagged* chain edges for one level.
+  // It only touches the child sharpness of chain edges, so the error stays
+  // localised to the seam: the surface drifts near the chain while topology and
+  // every unrelated crease are untouched.  This is the "wrong crease
+  // inheritance" fault the seam acceptance must separate from a position-only
+  // or normal-only problem.
+  const inheritFault = fault === FAULT.WRONG_INHERIT;
   const edgeParentSharp = new Float64Array(E);
   const edgeChildSharp = new Float64Array(E);
   for (let ei = 0; ei < E; ei++) {
@@ -140,7 +208,11 @@ export function subdivideLevel(level, optionsOverride = {}) {
     } else {
       const s = creaseMap.get(e.key) || 0;
       edgeParentSharp[ei] = s;
-      edgeChildSharp[ei] = decaySharpness(s);
+      if (inheritFault && s > 0 && level.creaseTags && level.creaseTags.has(e.key)) {
+        edgeChildSharp[ei] = 0;
+      } else {
+        edgeChildSharp[ei] = decaySharpness(s);
+      }
     }
   }
 
@@ -155,7 +227,17 @@ export function subdivideLevel(level, optionsOverride = {}) {
     const my = (pa[1] + pb[1]) * 0.5;
     const mz = (pa[2] + pb[2]) * 0.5;
     if (e.faces.length < 2 || s >= 1) {
-      edgePoints[ei] = [mx, my, mz];
+      if (fault === FAULT.WRONG_WEIGHT && s > 0) {
+        // Skew the midpoint 8% toward one endpoint.  Connectivity is untouched,
+        // so the stroked polyline stays continuous but leaves the engraved line.
+        edgePoints[ei] = [
+          pa[0] * 0.58 + pb[0] * 0.42,
+          pa[1] * 0.58 + pb[1] * 0.42,
+          pa[2] * 0.58 + pb[2] * 0.42,
+        ];
+      } else {
+        edgePoints[ei] = [mx, my, mz];
+      }
       continue;
     }
     const f0 = faceCenters[e.faces[0]];
@@ -164,10 +246,11 @@ export function subdivideLevel(level, optionsOverride = {}) {
     const sy = (pa[1] + pb[1] + f0[1] + f1[1]) * 0.25;
     const sz = (pa[2] + pb[2] + f0[2] + f1[2]) * 0.25;
     if (s > 0) {
+      const w = fault === FAULT.WRONG_WEIGHT ? s * 0.88 : s;
       edgePoints[ei] = [
-        mx * s + sx * (1 - s),
-        my * s + sy * (1 - s),
-        mz * s + sz * (1 - s),
+        mx * w + sx * (1 - w),
+        my * w + sy * (1 - w),
+        mz * w + sz * (1 - w),
       ];
     } else {
       edgePoints[ei] = [sx, sy, sz];
@@ -286,14 +369,52 @@ export function subdivideLevel(level, optionsOverride = {}) {
 
   // --- propagate creases to child edges ------------------------------------
   const newCreaseMap = new Map();
+  const newCreaseTags = new Map();
+  const newCreaseChainSegments = new Map();
+  const chainLengths = new Map();
+  for (const c of (level.creaseChains || [])) chainLengths.set(c.id, c.edges.length);
+  const inject = fault !== FAULT.NONE &&
+    (opts.faultLevel == null || level.level === opts.faultLevel);
   for (let ei = 0; ei < E; ei++) {
     const e = edges[ei];
-    if (e.faces.length < 2) continue;
-    const s = edgeChildSharp[ei];
-    if (!(s > 0)) continue;
+    const sChild = edgeChildSharp[ei];
+    if (!(sChild > 0)) continue;
     const ep = edgePointIndex[ei];
-    newCreaseMap.set(edgeKeyOf(e.a, ep), s);
-    newCreaseMap.set(edgeKeyOf(e.b, ep), s);
+
+    const tag = level.creaseTags && level.creaseTags.get(e.key);
+    // Author direction comes from the numbered chain, not the topology's min/max
+    // edge key: min/max flips every other segment and makes a traced stroke
+    // zig-zag.  `tag.a/b` are *this* level's endpoints in author order, updated
+    // each level below.
+    const forward = !tag || tag.a === e.a;
+    const start = forward ? e.a : e.b;
+    const end = forward ? e.b : e.a;
+    const first = { key: edgeKeyOf(start, ep), a: start, b: ep };
+    const second = { key: edgeKeyOf(ep, end), a: ep, b: end };
+
+    // Boundary edges stay boundary at the child level (they are re-discovered
+    // from the face structure), so only interior creases enter the sharpness map.
+    if (e.faces.length >= 2) {
+      newCreaseMap.set(first.key, sChild);
+      newCreaseMap.set(second.key, sChild);
+    }
+    if (!tag) continue;
+
+    let bucketIndex = tag.index;
+    if (inject && fault === FAULT.WRONG_PARENT) {
+      // File the children under the neighbouring segment's slot.  Geometry and
+      // the crease map are untouched; only the numbered chain's ordering breaks,
+      // which is exactly the "read the wrong parent edge" failure.
+      const len = chainLengths.get(tag.chainId) || 1;
+      bucketIndex = (tag.index + 1) % len;
+    }
+    const bucketList = newCreaseChainSegments.get(tag.chainId) || [];
+    const bucket = bucketList[bucketIndex] || (bucketList[bucketIndex] = []);
+    bucket.push(first, second);
+    newCreaseChainSegments.set(tag.chainId, bucketList);
+
+    newCreaseTags.set(first.key, { chainId: tag.chainId, index: bucketIndex, a: first.a, b: first.b });
+    newCreaseTags.set(second.key, { chainId: tag.chainId, index: bucketIndex, a: second.a, b: second.b });
   }
 
   const newCornerSet = new Set();
@@ -305,6 +426,9 @@ export function subdivideLevel(level, optionsOverride = {}) {
     faces: newFaces,
     creaseMap: newCreaseMap,
     cornerSet: newCornerSet,
+    creaseChains: level.creaseChains || [],
+    creaseTags: newCreaseTags,
+    creaseChainSegments: newCreaseChainSegments,
     options: opts,
     topology: null,
     rootVertexCount: level.rootVertexCount,

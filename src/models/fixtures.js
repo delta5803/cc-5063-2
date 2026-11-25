@@ -475,6 +475,139 @@ export function duplicateFaceMesh() {
   return { name: 'duplicate-face', positions, faces, creases: [], corners: [] };
 }
 
+// ---- seam fans / numbered crease chain regression ---------------------------
+
+/**
+ * Open cone-cap with a slit along one meridian.
+ *
+ * The slit carries two distinct vertex columns at identical positions: a seam
+ * that is coincident in projection but not welded.  The apex has `k + 1`
+ * incident edges (a non-4 valence vertex for k >= 4) and two boundary edges from
+ * the slit, so a crease chain welded at the apex exercises the extraordinary +
+ * boundary crease rule.
+ *
+ * @param {number} k       angular columns (apex valence = k + 1)
+ * @param {number} rings   radial rings (>= 2)
+ */
+export function seamFan(k = 5, rings = 3) {
+  if (k < 3) throw new Error('seamFan needs k >= 3');
+  if (rings < 2) throw new Error('seamFan needs at least 2 rings');
+  const positions = [];
+  const apex = positions.length;
+  positions.push([0, 0, 1.32]);
+  const radii = [];
+  const heights = [];
+  for (let r = 0; r < rings; r++) {
+    radii.push(0.42 + 0.4 * r);
+    heights.push(0.98 - 0.36 * r);
+  }
+  const cols = [];
+  const dup = [];
+  for (let r = 0; r < rings; r++) {
+    const ring = [];
+    for (let i = 0; i < k; i++) {
+      const a = (i / k) * Math.PI * 2;
+      const wobble = 0.05 * Math.sin(1.7 * i + 0.9 * r) + 0.03 * Math.cos(2.3 * i);
+      ring.push(positions.length);
+      positions.push([
+        (radii[r] + wobble) * Math.cos(a),
+        (radii[r] + wobble) * Math.sin(a),
+        heights[r] + 0.045 * Math.sin(2 * a + r),
+      ]);
+    }
+    cols.push(ring);
+    // duplicate of column 0, exactly coincident in projection (and in 3D)
+    dup.push(positions.length);
+    positions.push(positions[ring[0]].slice());
+  }
+  const faces = [];
+  // apex cap: k-1 triangles on the closed side, one triangle closing onto the
+  // duplicate column across the slit
+  for (let i = 0; i < k - 1; i++) faces.push([apex, cols[0][i], cols[0][i + 1]]);
+  faces.push([apex, cols[0][k - 1], dup[0]]);
+  // radial quad bands, oriented so each ring edge runs opposite to the cap
+  // triangle above it; the last sector uses the duplicate column
+  for (let r = 0; r < rings - 1; r++) {
+    for (let i = 0; i < k - 1; i++) {
+      faces.push([cols[r][i], cols[r + 1][i], cols[r + 1][i + 1], cols[r][i + 1]]);
+    }
+    faces.push([cols[r][k - 1], cols[r + 1][k - 1], dup[r + 1], dup[r]]);
+  }
+
+  // Numbered chain along the slit side: welded at the apex, ending at the rim
+  // vertex whose twin (dup[last]) is coincident in projection.
+  const slitEdges = [];
+  let prev = apex;
+  for (let r = 0; r < rings; r++) {
+    const cur = cols[r][0];
+    slitEdges.push([prev, cur]);
+    prev = cur;
+  }
+  // Auxiliary interior chain along column 1 (explicit interior crease edges).
+  const innerEdges = [];
+  for (let r = 0; r < rings - 1; r++) {
+    innerEdges.push([cols[r][1], cols[r + 1][1]]);
+  }
+
+  const creases = [];
+  for (const [a, b] of slitEdges) creases.push({ a, b, sharpness: Infinity });
+  for (const [a, b] of innerEdges) creases.push({ a, b, sharpness: Infinity });
+
+  return {
+    name: `seam-fan-k${k}`,
+    description:
+      `cone-cap slit seam, apex valence ${k + 1}: numbered crease chain welded at ` +
+      `the apex, far end projection-coincident with its slit twin`,
+    positions,
+    faces,
+    creases,
+    corners: [],
+    creaseChains: [
+      { id: 'slit', edges: slitEdges },
+      { id: 'inner', edges: innerEdges },
+    ],
+    meta: {
+      apexVertex: apex,
+      apexValence: k + 1,
+      seamPairs: dup.map((d, r) => ({ a: cols[r][0], b: d, ring: r })),
+      slitChainId: 'slit',
+      innerChainId: 'inner',
+      k,
+      rings,
+    },
+  };
+}
+
+/**
+ * The acceptance fixture: a seam fan with a numbered crease chain, plus a helper
+ * to flip one face adjacent to the chain (winding-independence regression).
+ */
+export function creaseChainRegression(k = 5, rings = 3) {
+  const fan = seamFan(k, rings);
+  return {
+    ...fan,
+    name: 'crease-chain-regression',
+    description:
+      'slit seam fan with numbered crease chain (welded at valence-' + (k + 1) +
+      ' apex, far end projection-coincident); regression for stroke tracing',
+  };
+}
+
+/** Reverse the winding of one face (used to prove stroke tracing ignores winding). */
+export function flipFace(mesh, faceIndex) {
+  const out = {
+    ...mesh,
+    faces: mesh.faces.map((f) => f.slice()),
+    positions: mesh.positions.map((p) => p.slice()),
+    creases: (mesh.creases || []).map((c) => ({ ...c })),
+    corners: (mesh.corners || []).slice(),
+    creaseChains: (mesh.creaseChains || []).map((c) => ({ id: c.id, edges: c.edges.map((e) => e.slice()) })),
+    meta: mesh.meta ? JSON.parse(JSON.stringify(mesh.meta)) : undefined,
+  };
+  out.faces[faceIndex] = out.faces[faceIndex].slice().reverse();
+  return out;
+}
+
 // ---------------------------------------------------------------- registry ---
 
 export const MODEL_BUILDERS = {
@@ -491,6 +624,10 @@ export const MODEL_BUILDERS = {
   'crease-ridge-sharp': () => creaseRidge(Infinity),
   'crease-at-extraordinary': () => creaseAtExtraordinary(Infinity),
   'semi-crease-at-extraordinary': () => creaseAtExtraordinary(2),
+  'seam-fan': () => seamFan(5, 3),
+  'seam-fan-k3': () => seamFan(3, 3),
+  'seam-fan-k6': () => seamFan(6, 3),
+  'crease-chain-regression': () => creaseChainRegression(5, 3),
   'non-manifold-edge': () => nonManifoldEdgeMesh(),
   'non-manifold-vertex': () => nonManifoldVertexMesh(),
   'degenerate-face': () => degenerateFaceMesh(),
@@ -503,6 +640,7 @@ export const VALID_MODEL_NAMES = [
   'open-cylinder', 'torus', 'concave-uneven', 'creased-cube',
   'sharp-corner-box', 'crease-ridge', 'crease-ridge-sharp',
   'crease-at-extraordinary', 'semi-crease-at-extraordinary',
+  'seam-fan', 'seam-fan-k3', 'seam-fan-k6', 'crease-chain-regression',
 ];
 
 export const INVALID_MODEL_NAMES = [

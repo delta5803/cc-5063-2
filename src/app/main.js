@@ -16,6 +16,12 @@ import { classifyVertices } from '../core/creases.js';
 import {
   checkOrientation, edgeAngleStats, findDuplicatePositions,
 } from '../core/quality.js';
+import {
+  traceCreaseChain, diagnoseStroke, traceToSegments,
+} from '../core/stroke.js';
+import { seamMetrics, topologyEvidence } from '../core/seams.js';
+import { subdivisionProperties, strokeAcceptance } from '../core/acceptance.js';
+import { minimiseFailingMesh, serializeRepro } from '../../tools/minimise.mjs';
 import { vdist, vlen } from '../core/vec3.js';
 import { modelByName, VALID_MODEL_NAMES, INVALID_MODEL_NAMES } from '../models/fixtures.js';
 import { buildTriangles, buildWireframe, buildPointCloud, buildCreaseSegments } from './geometry.js';
@@ -38,6 +44,9 @@ const COLORS = {
   edgePoint: 0x4ea1ff,
   limit: 0xffd166,
   selection: 0xff5d5d,
+  strokeOk: 0x6ff0b0,
+  strokeBreak: 0xff4d4d,
+  strokeDrift: 0xffc857,
 };
 
 // Counts of derived vertices can explode; cap the total vertex budget.
@@ -60,6 +69,13 @@ const state = {
   limitRoot: null,
   error: null,
   buildGeneration: 0,
+  stroke: {
+    visible: false,
+    fault: 'none',
+    faultLevel: 0,
+    chainId: null,
+  },
+  acceptance: null,
   show: {
     surface: true, wire: true, cage: true,
     facePoints: false, edgePoints: false,
@@ -74,7 +90,7 @@ let objects = {
   surface: null, wire: null, cage: null, cagePoints: null,
   facePoints: null, edgePoints: null, extraordinary: null,
   creaseLines: null, boundaryLines: null, limitPoints: null,
-  selectionRing: null,
+  selectionRing: null, stroke: null,
 };
 let surfacePickMesh = null;
 let triangleSource = null;
@@ -117,6 +133,15 @@ const el = {
   showExtra: document.getElementById('show-extraordinary'),
   showCrease: document.getElementById('show-crease'),
   showLimitPoints: document.getElementById('show-limitpoints'),
+  strokeToggle: document.getElementById('stroke-toggle'),
+  strokeInjectParent: document.getElementById('stroke-inject-parent'),
+  strokeInjectWeight: document.getElementById('stroke-inject-weight'),
+  strokeStatus: document.getElementById('stroke-status'),
+  strokeInfo: document.getElementById('stroke-info'),
+  runAcceptance: document.getElementById('run-acceptance'),
+  saveRepro: document.getElementById('save-repro'),
+  acceptStatus: document.getElementById('accept-status'),
+  acceptInfo: document.getElementById('accept-info'),
 };
 
 function init() {
@@ -269,6 +294,23 @@ function initUI() {
   el.editToggle.addEventListener('click', () => toggleEditMode());
   el.resetModel.addEventListener('click', () => loadModel(state.modelName, state.currentLevel));
 
+  el.strokeToggle.addEventListener('click', () => {
+    state.stroke.visible = !state.stroke.visible;
+    el.strokeToggle.classList.toggle('accent', state.stroke.visible);
+    rebuildStrokeOverlay();
+    setStatus(state.stroke.visible ? '折痕链描边已显示（由细分内核的编号段驱动）' : '描边已隐藏', '');
+  });
+  el.strokeInjectParent.addEventListener('click', () => {
+    state.stroke.fault = state.stroke.fault === 'wrong-parent' ? 'none' : 'wrong-parent';
+    rebuildStrokeOverlay();
+  });
+  el.strokeInjectWeight.addEventListener('click', () => {
+    state.stroke.fault = state.stroke.fault === 'wrong-weight' ? 'none' : 'wrong-weight';
+    rebuildStrokeOverlay();
+  });
+  el.runAcceptance.addEventListener('click', () => runAcceptancePanel());
+  el.saveRepro.addEventListener('click', () => saveReducedRepro());
+
   el.exportObj.addEventListener('click', () => {
     const lv = state.levels[state.currentLevel];
     if (!lv) return;
@@ -303,7 +345,17 @@ function loadModel(name, startLevel) {
     faces: model.faces.map((f) => f.slice()),
     creases: (model.creases || []).map((c) => ({ ...c })),
     corners: (model.corners || []).slice(),
+    creaseChains: (model.creaseChains || []).map((c) => ({
+      id: c.id, edges: c.edges.map((e) => e.slice()),
+    })),
+    meta: model.meta ? JSON.parse(JSON.stringify(model.meta)) : undefined,
   };
+  state.stroke.chainId = state.control.creaseChains.length ? state.control.creaseChains[0].id : null;
+  state.stroke.fault = 'none';
+  state.stroke.visible = state.stroke.visible && !!state.stroke.chainId;
+  state.acceptance = null;
+  el.acceptStatus.textContent = '—';
+  el.acceptInfo.classList.add('hidden');
   state.selectedControlVertex = -1;
   state.selectedLevelVertex = -1;
   state.error = null;
@@ -399,6 +451,7 @@ function clearSceneGraph() {
   }
   surfacePickMesh = null;
   triangleSource = null;
+  state.strokeGap = null;
 }
 
 function controlClassification() {
@@ -569,6 +622,11 @@ function buildSceneGraph() {
   // ---- limit points of the current level's vertices (toggle) ----
   if (state.show.limitPoints) buildLimitPoints(lv);
 
+  // ---- numbered crease-chain stroke (driven by the subdivision kernel) ----
+  // Rebuilt after the surface so it draws on top; resolves current level/fault.
+  state.strokeGap = null;
+  rebuildStrokeOverlay();
+
   // ---- selection ring ----
   const ringGeo = new THREE.BufferGeometry();
   ringGeo.setAttribute('position', new THREE.Float32BufferAttribute([0, 0, 0], 3));
@@ -636,6 +694,8 @@ function applyVisibility() {
   if (objects.creaseLines) objects.creaseLines.visible = state.show.crease;
   if (objects.boundaryLines) objects.boundaryLines.visible = state.show.crease;
   if (objects.limitPoints) objects.limitPoints.visible = state.show.limitPoints;
+  if (objects.stroke) objects.stroke.visible = state.stroke.visible;
+  if (objects.strokeGap) objects.strokeGap.visible = state.stroke.visible;
 }
 
 // ---------------------------------------------------------------- levels -----
@@ -888,10 +948,106 @@ function sci(x) {
   return x === 0 ? '0' : x.toExponential(2);
 }
 
+// ---------------------------------------------------------------- stroke -----
+
+// The stroke overlay is *driven by the subdivision kernel*: it traces the
+// numbered crease chain of the level currently shown, and when a fault is
+// injected it rebuilds that level with the fault so the overlay shows exactly
+// what the core produced.  Nothing here re-interpolates.
+function rebuildStrokeOverlay() {
+  disposeObject(objects.stroke);
+  objects.stroke = null;
+  const chainId = state.stroke.chainId;
+  if (!state.stroke.visible || !chainId) {
+    el.strokeStatus.textContent = chainId ? '已隐藏' : '无编号链';
+    el.strokeInfo.classList.add('hidden');
+    animationNeedsRender = true;
+    return;
+  }
+  const level = state.currentLevel;
+  let diagnosis;
+  try {
+    diagnosis = diagnoseStroke(state.control, level, chainId, {
+      fault: state.stroke.fault,
+      faultLevel: state.stroke.faultLevel,
+    });
+  } catch (e) {
+    showError(e, state.modelName);
+    return;
+  }
+
+  const trace = diagnosis.trace;
+  const faultedLevel = diagnosis.testLevel;
+  const flat = traceToSegments(trace);
+  if (flat.length) {
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.BufferAttribute(flat, 3));
+    const color = diagnosis.signature === 'broken-pen'
+      ? COLORS.strokeBreak
+      : diagnosis.signature === 'off-engraving'
+        ? COLORS.strokeDrift
+        : COLORS.strokeOk;
+    const mat = new THREE.LineBasicMaterial({ color, linewidth: 2 });
+    const line = new THREE.LineSegments(geo, mat);
+    line.renderOrder = 10;
+    line.name = 'stroke';
+    scene.add(line);
+    objects.stroke = line;
+  }
+
+  // Junction dots: a gap is drawn as a red marker so a broken pen is visible even
+  // at a glance, not only in the text panel.
+  const gapGeo = new THREE.BufferGeometry();
+  const gapPos = [];
+  for (const brk of diagnosis.breaks) {
+    const seg = trace.segments[brk.from];
+    const end = seg.points[seg.points.length - 1];
+    if (end) gapPos.push(end[0], end[1], end[2]);
+  }
+  gapGeo.setAttribute('position', new THREE.Float32BufferAttribute(gapPos, 3));
+  const gapMat = new THREE.PointsMaterial({
+    color: COLORS.strokeBreak, size: markerSize(faultedLevel) * 1.4,
+    depthTest: false, transparent: true, opacity: 0.95,
+  });
+  const gapPoints = new THREE.Points(gapGeo, gapMat);
+  gapPoints.renderOrder = 11;
+  scene.add(gapPoints);
+  objects.strokeGap = gapPoints;
+
+  state.stroke.diagnosis = diagnosis;
+  renderStrokeInfo(diagnosis);
+  animationNeedsRender = true;
+}
+
+function renderStrokeInfo(d) {
+  const sigLabel = {
+    ok: '连通且贴合刻线',
+    'broken-pen': '断笔（父边读取错位）',
+    'off-engraving': '笔画连通但偏离刻线（权重错误）',
+  }[d.signature] || d.signature;
+  const cls = d.signature === 'ok' ? 'good' : 'bad';
+  el.strokeStatus.textContent = `段数 ${d.trace.segments.length} · ${d.signature}`;
+  el.strokeInfo.classList.remove('hidden');
+  el.strokeInfo.innerHTML = `
+    <div class="kv"><span>判定</span><span class="tag ${cls}">${sigLabel}</span></div>
+    <div class="kv"><span>编号段</span><span>${d.trace.segments.length}</span></div>
+    <div class="kv"><span>连通</span><span>${d.connected ? '是' : `否（${d.breaks.length} 处断笔）`}</span></div>
+    <div class="kv"><span>偏离刻线</span><span>${sci(d.drift.max)}</span></div>
+    <div class="kv"><span>注入故障</span><span>${d.fault}</span></div>
+    <div class="kv"><span>第二级</span><span>${d.level >= 2 ? '已执行（L' + d.level + '）' : '当前为 L' + d.level}</span></div>
+  `;
+  el.strokeToggle.textContent = state.stroke.visible ? '隐藏描边' : '显示描边';
+  el.strokeToggle.classList.toggle('accent', state.stroke.visible);
+  el.strokeInjectParent.classList.toggle('accent', state.stroke.fault === 'wrong-parent');
+  el.strokeInjectWeight.classList.toggle('accent', state.stroke.fault === 'wrong-weight');
+}
+
 // ---------------------------------------------------------------- QA ---------
 
 function runDiagnostics(levels) {
   const rows = [];
+  const declaredSeams = state.control.meta && state.control.meta.seamPairs
+    ? state.control.meta.seamPairs.length : 0;
   for (let i = 0; i < levels.length; i++) {
     const lv = levels[i];
     const topo = lv.topology;
@@ -904,12 +1060,18 @@ function runDiagnostics(levels) {
     if (V <= 250_000) {
       dups = findDuplicatePositions(lv.positions, 1e-10).length;
     }
+    // Declared projection seams (the stroke regression) split into two per seam
+    // per subdivision level; anything beyond that is an accidental seam.
+    const expectedSeams = declaredSeams * (1 << i);
+    const accidentalSeams = Math.max(0, dups - expectedSeams);
     const angles = edgeAngleStats(lv.positions, lv.faces);
     rows.push({
       level: i,
       V, E, F, chi,
       boundaryEdges: topo.boundaryEdgeCount,
       duplicates: dups,
+      declaredSeams: expectedSeams,
+      accidentalSeams,
       maxAngleDeg: angles.maxAngleDeg,
       p99AngleDeg: angles.p99AngleDeg,
       medianAngleDeg: angles.medianAngleDeg,
@@ -969,7 +1131,7 @@ function runDiagnostics(levels) {
   const issues = [];
   const last = rows[rows.length - 1];
   for (const row of rows) {
-    if (row.duplicates > 0) issues.push(`L${row.level}: ${row.duplicates} 个接缝重复顶点 (per-face seam)`);
+    if (row.accidentalSeams > 0) issues.push(`L${row.level}: ${row.accidentalSeams} 个意外接缝重复顶点 (per-face seam)`);
     if (!row.orientationOk) issues.push(`L${row.level}: 面缠绕方向不一致`);
   }
   // Euler characteristic must stay constant across levels.
@@ -986,6 +1148,8 @@ function runDiagnostics(levels) {
       finalFaces: last.F,
       euler: last.chi,
       maxSeamDuplicates: Math.max(...rows.map((r) => r.duplicates)),
+      maxAccidentalSeams: Math.max(...rows.map((r) => r.accidentalSeams)),
+      declaredSeams,
       maxDihedralDeg: last.maxAngleDeg,
       p99DihedralDeg: last.p99AngleDeg,
       convergenceRatio: ratios.length ? ratios[ratios.length - 1] : null,
@@ -1004,6 +1168,135 @@ function computeRootLimits(l0) {
   return evaluateLimits(l0, { maxExtraLevels: 6 });
 }
 
+// ---------------------------------------------------------------- accept -----
+
+// Property acceptance, run from the UI against the *delivered* levels.  It is
+// the same predicate module the Node tests use, so the screen cannot report a
+// different conclusion than CI.
+function runAcceptancePanel() {
+  const levels = state.levels;
+  if (!levels || !levels.length) return;
+  const allowedSeams = state.control.creaseChains.length ? Infinity : 0;
+  const props = subdivisionProperties(levels, {
+    allowedSeams,
+    expectedEuler: state.diagnostics ? state.diagnostics.rows[0].chi : undefined,
+  });
+
+  // Stroke acceptance, when a numbered chain exists.
+  let stroke = null;
+  if (state.stroke.chainId && state.stroke.diagnosis) {
+    const expect = state.stroke.fault === 'none'
+      ? 'clean'
+      : state.stroke.fault === 'wrong-parent' ? 'broken-pen' : 'off-engraving';
+    stroke = strokeAcceptance(state.stroke.diagnosis, expect);
+  }
+
+  // Seam acceptance: inject a crease-inheritance fault and compare against clean.
+  // The fault only bites after a subdivision step, so at L0 there is nothing to
+  // detect; it is reported as not-applicable rather than as a failure.
+  let seam = null;
+  if (state.control.creaseChains.length) {
+    if (state.currentLevel === 0) {
+      seam = { notApplicable: true };
+    } else {
+      try {
+        const clean = buildRegularLevel(state.control, state.currentLevel, 'none');
+        const faulted = buildRegularLevel(state.control, state.currentLevel, 'wrong-inherit');
+        const indices = state.control.positions.map((_, i) => i);
+        const metrics = seamMetrics(clean, faulted, indices, { maxDartLevels: 0 });
+        seam = {
+          metrics,
+          detectedPosition: metrics.positionDelta.max > 1e-4,
+          detectedNormal: metrics.normalDelta.maxAngleDeg > 0.5,
+          topologyClean: topologyEvidence(faulted).ok,
+        };
+      } catch (e) {
+        seam = { error: e.message };
+      }
+    }
+  }
+
+  state.acceptance = { props, stroke, seam };
+  renderAcceptance();
+}
+
+// Rebuild a level from the control net with an optional fault.  Used by the
+// acceptance panel and by the repro saver; it never mutates scene state.
+function buildRegularLevel(control, level, fault) {
+  let cur = createControlLevel(control, {
+    boundaryMode: state.boundaryMode,
+    validateEachLevel: true,
+  });
+  for (let i = 0; i < level; i++) {
+    cur = subdivideLevel(cur, fault && fault !== 'none' ? { fault, faultLevel: 0 } : {});
+  }
+  return cur;
+}
+
+function renderAcceptance() {
+  const a = state.acceptance;
+  if (!a) return;
+  const seamOk = !a.seam || a.seam.notApplicable ||
+    (a.seam.detectedPosition && a.seam.detectedNormal && a.seam.topologyClean);
+  const okAll = a.props.ok && (!a.stroke || a.stroke.ok) && seamOk;
+  el.acceptStatus.textContent = okAll ? '通过' : '失败';
+  el.acceptStatus.className = 'badge ' + (okAll ? 'good' : 'bad');
+  el.acceptInfo.classList.remove('hidden');
+
+  const failedProps = a.props.checks.filter((c) => !c.ok);
+  let html = `<div class="kv"><span>细分性质</span><span>${a.props.ok ? '全部通过' : failedProps.length + ' 项失败'}</span></div>`;
+  if (!a.props.ok) {
+    html += `<div style="font-size:11px;line-height:1.5">${failedProps.slice(0, 5).map((c) => `${c.name}: ${JSON.stringify(c.evidence)}`).join('<br>')}</div>`;
+  }
+  if (a.stroke) {
+    html += `<div class="kv"><span>描边验收</span><span>${a.stroke.ok ? '通过' : '失败'}（${a.stroke.signature}）</span></div>`;
+  }
+  if (a.seam) {
+    if (a.seam.notApplicable) {
+      html += `<div class="kv"><span>接缝验收</span><span>当前为 L0，细分后生效</span></div>`;
+    } else if (a.seam.error) {
+      html += `<div class="kv"><span>接缝验收</span><span>错误：${escapeHtml(a.seam.error)}</span></div>`;
+    } else {
+      html += `<div class="kv"><span>接缝·位置差</span><span>${sci(a.seam.metrics.positionDelta.max)}</span></div>`;
+      html += `<div class="kv"><span>接缝·极限法线差</span><span>${a.seam.metrics.normalDelta.maxAngleDeg.toFixed(2)}°</span></div>`;
+      html += `<div class="kv"><span>接缝·拓扑完好</span><span>${a.seam.topologyClean ? '是' : '否'}</span></div>`;
+    }
+  }
+  el.acceptInfo.innerHTML = html;
+}
+
+function saveReducedRepro() {
+  if (!state.control.creaseChains.length) {
+    setStatus('当前模型没有编号折痕链，无法生成接缝复现网格', 'err');
+    return;
+  }
+  try {
+    const seeds = (state.control.meta && state.control.meta.seamPairs)
+      ? state.control.meta.seamPairs.map((p) => p.a)
+      : undefined;
+    const red = minimiseFailingMesh(state.control, {
+      fault: 'wrong-inherit',
+      faultLevel: 0,
+      level: Math.max(1, Math.min(state.currentLevel, 2)),
+      seedVertices: seeds,
+    });
+    const text = serializeRepro(red.mesh, {
+      sourceModel: state.modelName,
+      fault: 'wrong-inherit',
+      faultLevel: 0,
+      level: Math.max(1, Math.min(state.currentLevel, 2)),
+      rings: red.rings,
+      originalFaces: red.originalFaces,
+      reducedFaces: red.reducedFaces,
+      verified: red.verified.ok,
+    });
+    download(`${state.modelName}_seam_repro.json`, text, 'application/json');
+    setStatus(`已保存最小复现网格：${red.reducedFaces}/${red.originalFaces} 面（独立验证 ${red.verified.ok ? '通过' : '失败'}）`, 'ok');
+  } catch (e) {
+    showError(e, state.modelName);
+  }
+}
+
 function renderDiagnostics() {
   const d = state.diagnostics;
   if (!d) return;
@@ -1013,10 +1306,12 @@ function renderDiagnostics() {
   const last = d.rows[d.rows.length - 1];
 
   items.push({
-    cls: d.summary.maxSeamDuplicates === 0 ? 'good' : 'bad',
-    text: d.summary.maxSeamDuplicates === 0
-      ? '<b>连接检查通过</b>：所有层级均无“重合但分离”的接缝顶点，边点/面点由两侧面共享。'
-      : `<b>发现接缝</b>：最多 ${d.summary.maxSeamDuplicates} 对重合顶点，说明面被独立插值。`,
+    cls: d.summary.maxAccidentalSeams === 0 ? 'good' : 'bad',
+    text: d.summary.maxAccidentalSeams === 0
+      ? (d.summary.declaredSeams > 0
+        ? `<b>连接检查通过</b>：仅存在编号链声明的投影接缝（${d.summary.declaredSeams} 处，逐级翻倍），无意外重合顶点。`
+        : '<b>连接检查通过</b>：所有层级均无“重合但分离”的接缝顶点，边点/面点由两侧面共享。')
+      : `<b>发现接缝</b>：最多 ${d.summary.maxAccidentalSeams} 对意外重合顶点，说明面被独立插值。`,
   });
 
   const convOk = d.ratios.length > 2 && d.ratios[d.ratios.length - 1] != null && d.ratios[d.ratios.length - 1] < 0.8;
@@ -1046,7 +1341,10 @@ function renderDiagnostics() {
 
   // ---- level table ----
   el.levelTbody.innerHTML = d.rows.map((r) => {
-    const bad = r.duplicates > 0 || !r.orientationOk;
+    const bad = r.accidentalSeams > 0 || !r.orientationOk;
+    const seamCell = r.declaredSeams > 0
+      ? `${r.declaredSeams}<span style="opacity:.6">+${r.accidentalSeams}</span>`
+      : String(r.duplicates);
     return `<tr data-level="${r.level}" class="${bad ? 'bad' : ''}">
       <td>${r.level}</td>
       <td>${fmtCount(r.V)}</td>
@@ -1054,7 +1352,7 @@ function renderDiagnostics() {
       <td>${fmtCount(r.F)}</td>
       <td>${r.chi}</td>
       <td>${r.boundaryEdges}</td>
-      <td>${r.duplicates}</td>
+      <td>${seamCell}</td>
       <td>${r.maxAngleDeg.toFixed(1)}°</td>
       <td>${r.p99AngleDeg.toFixed(2)}°</td>
     </tr>`;

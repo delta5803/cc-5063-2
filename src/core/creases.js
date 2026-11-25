@@ -55,6 +55,58 @@ export function normalizeCorners(corners) {
 }
 
 /**
+ * Normalise a numbered crease-chain description.
+ *
+ * A chain is `{ id, edges: [[a,b], ...] }`; the order of `edges` is the numbering
+ * (segment 0 first).  Chains exist so a regression fixture can say "this is
+ * engraved segment #k" and a stroke tracer can prove each numbered segment
+ * survived refinement exactly once.  They do not create sharpness on their own:
+ * the same edges must also appear in `creases`, so there is one source of truth
+ * for how sharp an edge is.
+ *
+ * Returns the tag lookup used by the subdivision core to carry provenance to
+ * child edges.
+ */
+export function normalizeCreaseChains(creaseChains) {
+  const chains = [];
+  const tags = new Map();
+  if (!creaseChains) return { chains, tags };
+  for (let ci = 0; ci < creaseChains.length; ci++) {
+    const c = creaseChains[ci];
+    const id = c.id != null ? c.id : `chain-${ci}`;
+    if (tagsHasChain(tags, id)) throw new Error(`Duplicate crease chain id "${id}"`);
+    if (!Array.isArray(c.edges) || c.edges.length === 0) {
+      throw new Error(`Crease chain "${id}" has no edges`);
+    }
+    const edges = [];
+    for (let i = 0; i < c.edges.length; i++) {
+      const e = c.edges[i];
+      if (!Array.isArray(e) || e.length !== 2 ||
+        !Number.isInteger(e[0]) || !Number.isInteger(e[1]) || e[0] === e[1]) {
+        throw new Error(`Crease chain "${id}" segment ${i} is not a vertex pair`);
+      }
+      const key = edgeKey(e[0], e[1]);
+      if (tags.has(key)) {
+        throw new Error(`Crease chain "${id}" reuses edge ${key}`);
+      }
+      // Keep the author's order: segment i runs from a to b, and b is shared with
+      // segment i+1.  Stroke tracing relies on this to stay direction-consistent
+      // across levels; deriving direction from the min/max edge key instead would
+      // flip alternating segments.
+      tags.set(key, { chainId: id, index: i, a: e[0], b: e[1] });
+      edges.push([e[0], e[1]]);
+    }
+    chains.push({ id, edges });
+  }
+  return { chains, tags };
+}
+
+function tagsHasChain(tags, id) {
+  for (const t of tags.values()) if (t.chainId === id) return true;
+  return false;
+}
+
+/**
  * Classify every vertex of a topology given explicit creases/corners.
  * Returns an array indexed by vertex id.
  *

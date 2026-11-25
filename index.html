@@ -85,6 +85,31 @@
       </section>
 
       <section class="group">
+        <div class="row-between">
+          <span class="label">折痕链描边</span>
+          <span id="stroke-status" class="hint">无编号链</span>
+        </div>
+        <div class="row">
+          <button id="stroke-toggle" class="btn">显示描边</button>
+          <button id="stroke-inject-parent" class="btn">注入错父边</button>
+          <button id="stroke-inject-weight" class="btn">注入错权重</button>
+        </div>
+        <div id="stroke-info" class="info-box hidden"></div>
+      </section>
+
+      <section class="group">
+        <div class="row-between">
+          <span class="label">细分级验收入库</span>
+          <span id="accept-status" class="badge">—</span>
+        </div>
+        <div class="row">
+          <button id="run-acceptance" class="btn">运行验收</button>
+          <button id="save-repro" class="btn">保存失败最小网格</button>
+        </div>
+        <div id="accept-info" class="info-box hidden"></div>
+      </section>
+
+      <section class="group">
         <div class="row">
           <button id="export-obj" class="btn">导出 OBJ</button>
           <button id="export-json" class="btn">导出 JSON</button>

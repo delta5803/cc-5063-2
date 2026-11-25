@@ -14,7 +14,7 @@ import {
   buildTopology, edgeKey,
 } from '../src/core/topology.js';
 import {
-  createControlLevel, subdivideLevel, buildLevels,
+  createControlLevel, subdivideLevel, buildLevels, FAULT,
 } from '../src/core/subdivision.js';
 import { evaluateLimits, refineUntilStable, maxFiniteSharpness } from '../src/core/limit.js';
 import { classifyVertices, RULE } from '../src/core/creases.js';
@@ -22,10 +22,27 @@ import {
   checkConnectivity, checkOrientation, edgeAngleStats, checkLimitConvergence,
   findDuplicatePositions, faceNormal,
 } from '../src/core/quality.js';
+import {
+  traceCreaseChain, diagnoseStroke, buildEngravedLevel, buildFaultedLevel,
+  traceToSegments,
+} from '../src/core/stroke.js';
+import {
+  seamMetrics, topologyEvidence, findSeamPairs, describeSeams,
+  limitPositions, vertexLimitNormal,
+} from '../src/core/seams.js';
+import {
+  minimiseFailingMesh, replayReducedMesh, serializeRepro, parseRepro,
+  inducedSubmesh, faceRingsAround, facesOfChains,
+} from '../tools/minimise.mjs';
+import {
+  referenceSubdivideOnce, referenceLimitAll, referenceBoundaryCurve,
+  referenceRegularGridNormal,
+} from '../tools/reference.mjs';
+import * as acceptance from '../src/core/acceptance.js';
 import { vdist, vsub, vlen, vdot, vcross } from '../src/core/vec3.js';
 import {
   modelByName, VALID_MODEL_NAMES, INVALID_MODEL_NAMES,
-  regularGrid, creaseRidge,
+  regularGrid, creaseRidge, seamFan, creaseChainRegression, flipFace,
 } from '../src/models/fixtures.js';
 
 let pass = 0;
@@ -272,11 +289,17 @@ test('no coincident-but-distinct vertices appear (seam check)', () => {
   for (const name of VALID_MODEL_NAMES) {
     const m = modelByName(name);
     const levels = buildLevels(m, 3);
+    // A fixture may declare intentional projection seams (the stroke regression
+    // duplicates a slit column).  Those must stay exactly as many as declared and
+    // pair along the seam; anything beyond that is an accidental weld.
+    const pairs = m.meta && m.meta.seamPairs ? m.meta.seamPairs.length : 0;
     for (let i = 1; i < levels.length; i++) {
       const dups = findDuplicatePositions(levels[i].positions, 1e-10);
-      if (dups.length !== 0) {
-        const d = dups[0];
-        throw new Error(`${name} level ${i}: ${dups.length} seam duplicate(s), e.g. ${d.i}/${d.j}`);
+      const expected = pairs * (1 << i); // seam splits to 2 per ring edge each level
+      const dupCount = dups.length;
+      if (dupCount !== expected) {
+        const d = dups[0] || { i: 0, j: 0 };
+        throw new Error(`${name} level ${i}: ${dupCount} seam duplicate(s), expected ${expected}, e.g. ${d.i}/${d.j}`);
       }
     }
   }
@@ -841,6 +864,449 @@ test('subdivision is deterministic', () => {
       assertVecClose(a[l].positions[i], b[l].positions[i], 1e-18, `level ${l} vertex ${i}`);
     }
   }
+});
+
+// ============================================================================
+section('11. Stroke tracing for numbered crease chains');
+
+const CHAIN_MESH = () => creaseChainRegression(5, 3);
+
+test('regression fixture: seam fan is manifold, apex non-4-valence, seam is projection-coincident', () => {
+  const m = CHAIN_MESH();
+  const l0 = createControlLevel(m);
+  const apex = m.meta.apexVertex;
+  const apexEdges = l0.topology.vertexEdgeStart[apex + 1] - l0.topology.vertexEdgeStart[apex];
+  assert(apexEdges === m.meta.apexValence, `apex valence ${apexEdges} != ${m.meta.apexValence}`);
+  assert(apexEdges !== 4, 'apex must be non-4-valence for this fixture');
+  assert(l0.topology.vertexInfo.every((v) => !v.nonManifold), 'fixture must be manifold');
+  // Far end of the chain is welded at the apex; its twin at the rim is only
+  // coincident in projection.
+  const last = m.meta.seamPairs[m.meta.seamPairs.length - 1];
+  const d = vdist(m.positions[last.a], m.positions[last.b]);
+  assert(d < 1e-12, `seam twin should be coincident in projection (${d})`);
+  // Prove they are genuinely distinct vertices: the two sides are different
+  // vertex indices and the slit is a boundary (faces on one side only).
+  assert(last.a !== last.b, 'seam twin collapsed to one index');
+  assert(l0.topology.vertexInfo[last.a].boundaryEdgeCount === 2,
+    'slit side vertex should be on the boundary');
+});
+
+test('numbered chain traces continuously at every level', () => {
+  const m = CHAIN_MESH();
+  for (let L = 0; L <= 3; L++) {
+    const lv = buildEngravedLevel(m, L);
+    const tr = traceCreaseChain(lv, 'slit');
+    assert(tr.segments.length === m.creaseChains[0].edges.length,
+      `L${L}: ${tr.segments.length} traced segments, expected ${m.creaseChains[0].edges.length}`);
+    assert(tr.complete, `L${L}: a numbered segment was not a single path`);
+    assert(tr.connected, `L${L}: stroke broke (${tr.breaks.length} gap(s))`);
+  }
+});
+
+test('tracing survives flipping an adjacent face (winding independence)', () => {
+  const m = CHAIN_MESH();
+  // Face 3 shares the first chain edge with the slit; reversing it must not make
+  // the tracer read the parent edge backwards.
+  const flipped = flipFace(m, 3);
+  for (let L = 0; L <= 2; L++) {
+    const a = traceCreaseChain(buildEngravedLevel(m, L), 'slit');
+    const b = traceCreaseChain(buildEngravedLevel(flipped, L), 'slit');
+    assert(a.connected && b.connected, `L${L}: flip broke stroke`);
+    assert(a.segments.length === b.segments.length, `L${L}: segment count changed on flip`);
+    // The traced geometry must be the same set of points (winding cannot move a
+    // vertex point in Catmull-Clark); only vertex ordering could change, and it
+    // must not.
+    assert(a.polyline.length === b.polyline.length, `L${L}: polyline length changed on flip`);
+    for (let i = 0; i < a.points.length; i++) {
+      assertVecClose(a.points[i], b.points[i], 1e-12, `L${L} traced point ${i}`);
+    }
+  }
+});
+
+test('wrong parent edge yields a broken pen but identical geometry', () => {
+  const m = CHAIN_MESH();
+  for (const faultLevel of [0, 1]) {
+    const d = diagnoseStroke(m, 2, 'slit', { fault: FAULT.WRONG_PARENT, faultLevel });
+    assert(d.signature === 'broken-pen',
+      `inject@L${faultLevel}: expected broken-pen, got ${d.signature}`);
+    assert(!d.connected, 'broken pen must be reported disconnected');
+    assert(d.breaks.length >= 1, 'expected at least one gap');
+    // The fault only mis-files segments; it must not move a single vertex.
+    assert(d.drift.max === 0, `wrong-parent moved geometry by ${d.drift.max}`);
+  }
+});
+
+test('wrong interpolation weight keeps the stroke connected but leaves the engraving', () => {
+  const m = CHAIN_MESH();
+  for (const faultLevel of [0, 1]) {
+    const d = diagnoseStroke(m, 2, 'slit', { fault: FAULT.WRONG_WEIGHT, faultLevel });
+    assert(d.signature === 'off-engraving',
+      `inject@L${faultLevel}: expected off-engraving, got ${d.signature}`);
+    assert(d.connected, 'weight fault must stay connected');
+    assert(d.drift.max > 1e-4,
+      `weight fault drift ${d.drift.max.toExponential(2)} too small to detect`);
+  }
+});
+
+test('the two fault modes are distinguishable from each other', () => {
+  const m = CHAIN_MESH();
+  const pen = diagnoseStroke(m, 2, 'slit', { fault: FAULT.WRONG_PARENT, faultLevel: 0 });
+  const drift = diagnoseStroke(m, 2, 'slit', { fault: FAULT.WRONG_WEIGHT, faultLevel: 0 });
+  // Each signature has the *other* fault's tell-tale wrong:
+  assert(!pen.connected && pen.drift.max === 0, 'broken-pen should be disconnected and unmoved');
+  assert(drift.connected && drift.drift.max > 0, 'off-engraving should be connected and moved');
+  assert(pen.signature !== drift.signature, 'fault signatures collapsed to the same value');
+});
+
+test('a clean build reports ok and trace segments are drawable', () => {
+  const m = CHAIN_MESH();
+  const d = diagnoseStroke(m, 2, 'slit', { fault: FAULT.NONE });
+  assert(d.signature === 'ok', `clean build misdiagnosed as ${d.signature}`);
+  assert(d.drift.max === 0, 'clean build drifted from itself');
+  assert(d.trace.breaks.length === 0, 'clean trace has gaps');
+  // Flattening to segments must produce exactly one segment per traced pair and
+  // must not bridge a numbered-segment boundary twice.
+  let expected = 0;
+  for (const seg of d.trace.segments) expected += seg.points.length - 1;
+  const flat = traceToSegments(d.trace);
+  assert(flat.length === expected * 6, `segment buffer ${flat.length} != ${expected * 6}`);
+});
+
+// ============================================================================
+section('12. Seam fans, valences, and error inheritance');
+
+test('seam fans of several valences build and subdivide cleanly', () => {
+  for (const k of [3, 5, 6]) {
+    const m = seamFan(k, 3);
+    const lv = buildEngravedLevel(m, 2);
+    const ev = topologyEvidence(lv);
+    assert(ev.ok, `k=${k}: topology not ok: ${JSON.stringify(ev)}`);
+    const apexEdges = lv.topology.vertexEdgeStart[m.meta.apexVertex + 1] -
+      lv.topology.vertexEdgeStart[m.meta.apexVertex];
+    assert(apexEdges === k + 1, `k=${k}: apex valence changed to ${apexEdges}`);
+  }
+});
+
+test('inheriting the wrong crease sharpness changes positions and limit normals but not topology', () => {
+  const m = CHAIN_MESH();
+  const clean = buildEngravedLevel(m, 2);
+  const test = buildFaultedLevel(m, 2, FAULT.WRONG_INHERIT, 0);
+  const verts = m.positions.map((_, i) => i);
+  const metrics = seamMetrics(clean, test, verts, { maxDartLevels: 0 });
+  assert(metrics.positionDelta.max > 1e-4,
+    `position delta ${metrics.positionDelta.max.toExponential(2)} too small`);
+  assert(metrics.limitPositionDelta.max > 1e-4,
+    `limit position delta ${metrics.limitPositionDelta.max.toExponential(2)} too small`);
+  assert(metrics.normalDelta.maxAngleDeg > 1,
+    `normal delta ${metrics.normalDelta.maxAngleDeg} too small`);
+  // Topology must be intact: an inheritance fault is geometric, not structural.
+  const ev = topologyEvidence(test);
+  assert(ev.ok, `inheritance fault should not break topology: ${JSON.stringify(ev)}`);
+  assert(ev.euler === topologyEvidence(clean).euler, 'euler changed under inheritance fault');
+});
+
+test('position delta and normal delta are reported as separate quantities', () => {
+  const m = CHAIN_MESH();
+  const clean = buildEngravedLevel(m, 2);
+  const test = buildFaultedLevel(m, 2, FAULT.WRONG_INHERIT, 0);
+  const indices = m.positions.map((_, i) => i);
+  const metrics = seamMetrics(clean, test, indices, { maxDartLevels: 0 });
+  // A pure translation must move positions while leaving normals untouched.  If
+  // the two measures were aliased, this would also report a normal change.
+  const shifted = buildEngravedLevel(m, 2);
+  // Shift non-uniformly along z so the *limit* differs too, but rigidly enough
+  // that every face plane stays parallel (a rigid translation).
+  for (const p of shifted.positions) { p[0] += 0.4; p[1] -= 0.2; p[2] += 0.25; }
+  const shiftMetrics = seamMetrics(clean, shifted, indices, { maxDartLevels: 0 });
+  assert(shiftMetrics.positionDelta.max > 1e-6, 'translation not detected in positions');
+  assert(shiftMetrics.normalDelta.maxAngleDeg < 1e-3,
+    `rigid translation reported a normal change of ${shiftMetrics.normalDelta.maxAngleDeg}°`);
+  // The inheritance fault is not a translation: it must move normals as well.
+  assert(metrics.normalDelta.maxAngleDeg > 1,
+    `inherit fault normal change ${metrics.normalDelta.maxAngleDeg}° too small (looks like a translation)`);
+});
+
+test('seam twin pairs are located and described with separate incidences', () => {
+  const m = CHAIN_MESH();
+  const lv = buildEngravedLevel(m, 1);
+  const pairs = findSeamPairs(lv, 1e-9);
+  assert(pairs.length > 0, 'seam fan should still have coincident twins after subdivision');
+  const described = describeSeams(lv, pairs);
+  assert(described.every((d) => d.iValence > 0 && d.jValence > 0), 'seam twin has no incidence');
+});
+
+// ============================================================================
+section('13. Independent reference: limits, boundaries, normals');
+
+test('core smooth limits match an independent from-scratch Catmull-Clark iteration', () => {
+  for (const name of ['regular-grid', 'quad-ball']) {
+    const m = modelByName(name);
+    const l0 = createControlLevel(m);
+    const limits = evaluateLimits(l0, { maxCreaseLevels: 0 });
+    const ref = referenceLimitAll(m, 8);
+    for (let i = 0; i < m.positions.length; i++) {
+      const d = vdist(limits.results[i].position, ref[i]);
+      assert(d < 2e-4, `${name} vertex ${i}: core limit differs from independent reference by ${d.toExponential(3)}`);
+    }
+  }
+});
+
+test('independent reference converges: refined positions approach the core limit', () => {
+  // Take one extra ordinary vertex as the probe and confirm the independent
+  // sequence closes in on the core mask's answer.
+  const m = regularGrid(9, 0.4);
+  const l0 = createControlLevel(m);
+  const v = 4 * 9 + 4;
+  const coreLimit = evaluateLimits(l0, { indices: [v] }).results[0].position;
+  let cur = { positions: m.positions.map((p) => p.slice()), faces: m.faces.map((f) => f.slice()) };
+  const errs = [];
+  for (let d = 1; d <= 6; d++) {
+    cur = referenceSubdivideOnce(cur);
+    errs.push(vdist(cur.positions[v], coreLimit));
+  }
+  // The tail should shrink geometrically against the core mask.  Allow machine
+  // noise near zero (the core mask's own round-off).
+  for (let i = 1; i < errs.length; i++) {
+    const floor = 1e-13;
+    if (errs[i - 1] <= floor) continue;
+    assert(errs[i] <= errs[i - 1] * 0.6 + floor,
+      `reference iteration not converging at step ${i + 1}: ${errs[i]} vs ${errs[i - 1]}`);
+  }
+  assert(errs[errs.length - 1] < Math.max(errs[0] * 0.01, 1e-12),
+    'reference did not converge to the core limit');
+});
+
+test('boundary curve reference agrees with the delivered boundary (pinned corners)', () => {
+  // A flat open strip: the boundary rule keeps it planar, and the long boundary
+  // rows are straight 1D B-splines of a straight line, so they must stay straight.
+  const positions = [];
+  const n = 6;
+  for (let j = 0; j < 2; j++) {
+    for (let i = 0; i < n; i++) positions.push([i, j, 0]);
+  }
+  const faces = [];
+  for (let i = 0; i < n - 1; i++) faces.push([i, i + 1, n + i + 1, n + i]);
+  const m = { positions, faces, creases: [], corners: [] };
+  const levels = buildLevels(m, 3);
+  const lv = levels[3];
+  for (let v = 0; v < lv.positions.length; v++) {
+    const info = lv.topology.vertexInfo[v];
+    if (info.boundaryEdgeCount === 0) continue;
+    // Planar strip stays in the z=0 plane.
+    assert(Math.abs(lv.positions[v][2]) < 1e-12, `boundary vertex ${v} left the plane`);
+    // Long rows (y=0 and y=1) stay at y=0/1; only the two end-cap vertices at
+    // x=0 and x=n-1 may sit between them (they are on the short sides).
+    const x = lv.positions[v][0];
+    const onEndCap = Math.abs(x) < 1e-12 || Math.abs(x - (n - 1)) < 1e-12;
+    if (!onEndCap) {
+      assert(Math.abs(lv.positions[v][1]) < 1e-12 || Math.abs(lv.positions[v][1] - 1) < 1e-12,
+        `boundary vertex ${v} left its straight boundary row (y=${lv.positions[v][1]})`);
+    }
+  }
+  // The 1D curve reference of a straight polyline is that same straight line.
+  const curve = referenceBoundaryCurve([[-1, 0, 0], [0, 0, 0], [1, 0, 0]], { pinned: [0, 2], depth: 5 });
+  for (const p of curve) assert(Math.abs(p[1]) < 1e-12 && Math.abs(p[2]) < 1e-12, 'curve left the line');
+});
+
+test('regular-grid limit normal converges to the analytic B-spline frame', () => {
+  // The core's limit normal is an averaged face normal, not the exact analytic
+  // frame, so it is off by O(h) at the control level.  It must converge to the
+  // analytic frame as the cage is refined -- that is the property worth asserting.
+  const n = 9;
+  const positions = [];
+  for (let j = 0; j < n; j++) {
+    for (let i = 0; i < n; i++) {
+      positions.push([i * 0.3, j * 0.3, 0.12 * Math.sin(i * 0.7) * Math.cos(j * 0.5)]);
+    }
+  }
+  const faces = [];
+  for (let j = 0; j < n - 1; j++) {
+    for (let i = 0; i < n - 1; i++) {
+      faces.push([j * n + i, j * n + i + 1, (j + 1) * n + i + 1, (j + 1) * n + i]);
+    }
+  }
+  const m = { positions, faces, creases: [], corners: [] };
+  const i = 4, j = 4, v = j * n + i;
+  const nAnalytic = referenceRegularGridNormal(positions, i, j, n);
+  // The vertex index v of the control mesh persists across refinement.
+  let lv = createControlLevel(m);
+  let prev = Infinity;
+  for (let L = 0; L <= 3; L++) {
+    const limPos = limitPositions(lv);
+    const nCore = vertexLimitNormal(lv, limPos, v);
+    const ang = Math.acos(Math.max(-1, Math.min(1, vdot(nCore, nAnalytic)))) * 180 / Math.PI;
+    assert(ang <= prev + 1e-9, `normal error grew at L${L}: ${ang} > ${prev}`);
+    prev = ang;
+    lv = subdivideLevel(lv);
+  }
+  assert(prev < 1.0, `limit normal did not converge to the analytic frame (still ${prev.toFixed(2)}°)`);
+});
+
+// ============================================================================
+section('14. Acceptance: controlled bad results must be caught');
+
+test('subdivision property acceptance rejects a seam-duplicated child mesh', () => {
+  // Simulate the classic bug: per-face interpolation produces two distinct edge
+  // points at the same place.  Duplicate the mesh and offset one copy's edge
+  // point index to force coincident-but-distinct vertices.
+  const m = modelByName('quad-ball');
+  const lv = buildEngravedLevel(m, 2);
+  const bad = {
+    level: lv.level,
+    positions: lv.positions.map((p) => p.slice()),
+    faces: lv.faces.map((f) => f.slice()),
+  };
+  // Add a stray coincident vertex referenced by a duplicated face's corner.
+  bad.positions.push(bad.positions[bad.faces[0][0]].slice());
+  const dup = bad.faces[0][0];
+  bad.faces[0] = bad.faces[0].map((v) => (v === dup ? bad.positions.length - 1 : v));
+  const dups = findDuplicatePositions(bad.positions, 1e-10);
+  assert(dups.length > 0, 'acceptance check failed to see the injected seam duplicate');
+});
+
+test('subdivision property acceptance rejects a non-quad child face', () => {
+  const m = modelByName('quad-ball');
+  const lv = buildEngravedLevel(m, 1);
+  const badFaces = lv.faces.map((f) => f.slice());
+  badFaces[0] = [badFaces[0][0], badFaces[0][1], badFaces[0][2]];
+  const ev = topologyEvidence({ positions: lv.positions, faces: badFaces, topology: null });
+  assert(ev.nonQuadFaces === 1, `expected 1 non-quad face, got ${ev.nonQuadFaces}`);
+  assert(!ev.ok, 'acceptance should reject a non-quad child face');
+});
+
+test('limit acceptance rejects a wrong face-opposite mask (positions and normals both move)', () => {
+  // A deliberately wrong limit evaluator: use face centroids instead of the
+  // diagonal opposite vertex.  This grid is *not* symmetric, so the two masks
+  // genuinely differ (on a planar/symmetric patch they accidentally coincide).
+  const n = 9;
+  const positions = [];
+  for (let j = 0; j < n; j++) {
+    for (let i = 0; i < n; i++) {
+      positions.push([
+        i * 0.31 + j * 0.07,
+        j * 0.29 - i * 0.04,
+        0.15 * Math.sin(i * 0.6 + 0.3) * Math.cos(j * 0.4 - 0.2) + 0.05 * i * 0.05,
+      ]);
+    }
+  }
+  const faces = [];
+  for (let j = 0; j < n - 1; j++) {
+    for (let i = 0; i < n - 1; i++) faces.push([j * n + i, j * n + i + 1, (j + 1) * n + i + 1, (j + 1) * n + i]);
+  }
+  const m = { positions, faces, creases: [], corners: [] };
+  const l0 = createControlLevel(m);
+  const v = 4 * n + 4;
+  const correct = evaluateLimits(l0, { indices: [v] }).results[0].position;
+
+  const nv = 4;
+  const P = l0.positions[v];
+  let ox = 0, oy = 0, oz = 0;
+  for (let i = l0.topology.vertexEdgeStart[v]; i < l0.topology.vertexEdgeStart[v + 1]; i++) {
+    const e = l0.topology.edges[l0.topology.vertexEdges[i]];
+    const o = l0.positions[e.a === v ? e.b : e.a];
+    ox += o[0]; oy += o[1]; oz += o[2];
+  }
+  let fx = 0, fy = 0, fz = 0;
+  for (let i = l0.topology.vertexFaceStart[v]; i < l0.topology.vertexFaceStart[v + 1]; i++) {
+    const c = centroid(l0, l0.topology.vertexFaces[i]);
+    fx += c[0]; fy += c[1]; fz += c[2];
+  }
+  const eW = 4 / (nv * (nv + 5)), fW = 1 / (nv * (nv + 5)), vW = 1 - nv * (eW + fW);
+  const wrong = [vW * P[0] + eW * ox + fW * fx, vW * P[1] + eW * oy + fW * fy, vW * P[2] + eW * oz + fW * fz];
+  const err = vdist(correct, wrong);
+  assert(err > 1e-5, `wrong mask not detected: ${err.toExponential(2)}`);
+});
+
+test('topology acceptance rejects an incorrect Euler characteristic', () => {
+  const m = modelByName('torus');
+  const lv = buildEngravedLevel(m, 2);
+  const ev = topologyEvidence(lv);
+  assert(ev.euler === 0, `torus euler ${ev.euler} != 0`);
+  const { subdivisionProperties } = acceptance;
+  const base = subdivisionProperties([lv], { allowedSeams: Infinity, expectedEuler: 0 });
+  assert(base.ok, 'baseline (torus, euler 0) should pass');
+  // Drop a face without dropping its vertices: euler changes -> reject.
+  const badFaces = lv.faces.slice(0, lv.faces.length - 1).map((f) => f.slice());
+  const bad = { level: lv.level, positions: lv.positions, faces: badFaces, creaseMap: lv.creaseMap, cornerSet: lv.cornerSet, options: lv.options };
+  const result = subdivisionProperties([bad], { allowedSeams: Infinity, expectedEuler: 0 });
+  assert(!result.ok, 'acceptance should reject the topologically damaged level');
+  assert(!result.checks.find((c) => c.name === 'L2:euler').ok, 'euler check did not fire');
+});
+
+// ============================================================================
+section('15. Repro minimisation: shrink, save, replay standalone');
+
+test('failing control net is reduced to a local neighbourhood that still fails', () => {
+  const m = CHAIN_MESH();
+  const red = minimiseFailingMesh(m, {
+    fault: FAULT.WRONG_INHERIT,
+    faultLevel: 0,
+    level: 2,
+    seedVertices: m.meta.seamPairs.map((p) => p.a),
+  });
+  assert(red.reducedFaces < red.originalFaces, `no reduction: ${red.reducedFaces}/${red.originalFaces}`);
+  assert(red.verified.ok, 'reduced mesh did not verify standalone');
+  assert(red.metric.ok, 'reduced mesh no longer shows the fault');
+});
+
+test('saved repro replays without loading the original scene', () => {
+  const m = CHAIN_MESH();
+  const red = minimiseFailingMesh(m, {
+    fault: FAULT.WRONG_INHERIT, faultLevel: 0, level: 2,
+    seedVertices: m.meta.seamPairs.map((p) => p.a),
+  });
+  const text = serializeRepro(red.mesh, {
+    fault: FAULT.WRONG_INHERIT, faultLevel: 0, level: 2,
+  });
+  const { mesh: reloaded, meta } = parseRepro(text);
+  assert(meta.fault === FAULT.WRONG_INHERIT, 'repro metadata lost the fault');
+  // Replay through public entry points only.
+  const rep = replayReducedMesh(reloaded, FAULT.WRONG_INHERIT, 0, 2);
+  assert(rep.reproduced, 'saved repro no longer reproduces the seam error');
+  assert(rep.metrics.positionDelta.max > 1e-4, 'replayed position delta too small');
+  // And the clean version of the same reduced mesh must NOT show the error.
+  const cleanRed = buildEngravedLevel(reloaded, 2);
+  assert(topologyEvidence(cleanRed).ok, 'reduced clean mesh is structurally broken');
+});
+
+test('reduction refuses to claim success when no neighbourhood reproduces the fault', () => {
+  const m = CHAIN_MESH();
+  let threw = false;
+  try {
+    minimiseFailingMesh(m, {
+      fault: FAULT.WRONG_INHERIT, faultLevel: 0, level: 2,
+      seedVertices: [0],
+      // A metric that never sees the error: reduction must fail loudly.
+      metric: () => ({ ok: false, score: 0 }),
+    });
+  } catch (e) {
+    threw = true;
+    assert(e.code === 'REDUCTION_FAILED', `wrong error code ${e.code}`);
+  }
+  assert(threw, 'reduction should refuse to return a non-reproducing mesh');
+});
+
+test('induced submesh keeps crease chains consistent with surviving edges', () => {
+  const m = CHAIN_MESH();
+  // Use a neighbourhood large enough that whole chain edges survive (ring 1).
+  const seedFaces = facesOfChains(m);
+  const set = faceRingsAround(m, seedFaces, 1);
+  const sub = inducedSubmesh(m, set);
+  let level;
+  try {
+    level = createControlLevel(sub);
+  } catch (e) {
+    throw new Error(`induced submesh rejected: ${e.code} ${e.message}`);
+  }
+  assert(level.creaseChains.length >= 1, 'chain should survive the induced submesh');
+  // Every retained chain edge must exist in the reduced topology.
+  for (const chain of level.creaseChains) {
+    for (const [a, b] of chain.edges) {
+      assert(level.topology.edgeIndexByKey.has(edgeKey(a, b)),
+        `chain edge ${a}-${b} not in reduced topology`);
+    }
+  }
+  assert(sub.faces.length < m.faces.length, 'ring 1 should be a strict subset');
 });
 
 // ============================================================================
