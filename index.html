@@ -1,0 +1,131 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>四边形细分建模器 · Catmull–Clark</title>
+  <link rel="icon" href="data:," />
+  <link rel="stylesheet" href="./styles.css" />
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "./vendor/three.module.js",
+        "three/addons/": "./vendor/addons/"
+      }
+    }
+  </script>
+</head>
+<body>
+  <div id="app">
+    <canvas id="viewport"></canvas>
+
+    <aside id="left-panel" class="panel">
+      <header class="panel-header">
+        <h1>四边形细分建模器</h1>
+        <p class="subtitle">Catmull–Clark · 真实共享拓扑</p>
+      </header>
+
+      <section class="group">
+        <label class="field">
+          <span>测试模型</span>
+          <select id="model-select"></select>
+        </label>
+        <div id="model-desc" class="hint"></div>
+      </section>
+
+      <section class="group">
+        <div class="row-between">
+          <span class="label">细分层级</span>
+          <span id="level-badge" class="badge">L0</span>
+        </div>
+        <input id="level-slider" type="range" min="0" max="5" step="1" value="0" />
+        <div class="row">
+          <button id="level-prev" class="btn">上一级</button>
+          <button id="level-next" class="btn">下一级</button>
+          <button id="level-max" class="btn accent">细分到底</button>
+        </div>
+      </section>
+
+      <section class="group">
+        <div class="row-between">
+          <span class="label">边界处理</span>
+        </div>
+        <div class="row">
+          <label class="radio"><input type="radio" name="boundary" value="edgeAndCorner" checked /> 边+角</label>
+          <label class="radio"><input type="radio" name="boundary" value="edgeOnly" /> 仅边</label>
+        </div>
+      </section>
+
+      <section class="group">
+        <div class="row-between">
+          <span class="label">显示</span>
+        </div>
+        <div class="checks">
+          <label><input type="checkbox" id="show-surface" checked /> 曲面</label>
+          <label><input type="checkbox" id="show-wire" checked /> 拓扑线框</label>
+          <label><input type="checkbox" id="show-cage" checked /> 控制网</label>
+          <label><input type="checkbox" id="show-facepoints" /> 面点</label>
+          <label><input type="checkbox" id="show-edgepoints" /> 边点</label>
+          <label><input type="checkbox" id="show-extraordinary" checked /> 非规则顶点</label>
+          <label><input type="checkbox" id="show-crease" checked /> 折痕 / 边界</label>
+          <label><input type="checkbox" id="show-limitpoints" /> 极限位置</label>
+        </div>
+      </section>
+
+      <section class="group">
+        <div class="row-between">
+          <span class="label">编辑控制网</span>
+          <span id="edit-status" class="hint">点击顶点选中</span>
+        </div>
+        <div class="row">
+          <button id="edit-toggle" class="btn">进入编辑</button>
+          <button id="reset-model" class="btn">重置模型</button>
+        </div>
+        <div id="selected-info" class="info-box hidden"></div>
+      </section>
+
+      <section class="group">
+        <div class="row">
+          <button id="export-obj" class="btn">导出 OBJ</button>
+          <button id="export-json" class="btn">导出 JSON</button>
+        </div>
+      </section>
+    </aside>
+
+    <aside id="right-panel" class="panel">
+      <header class="panel-header">
+        <h2>质检报告</h2>
+        <p class="subtitle">连接 · 收敛 · 法线连续</p>
+      </header>
+      <div id="error-box" class="error-box hidden"></div>
+      <div id="quality-summary" class="summary"></div>
+      <div class="table-wrap">
+        <table id="level-table">
+          <thead>
+            <tr>
+              <th>级</th><th>顶点</th><th>边</th><th>面</th>
+              <th>χ</th><th>边界</th><th>接缝</th><th>最大∠</th><th>P99</th>
+            </tr>
+          </thead>
+          <tbody id="level-tbody"></tbody>
+        </table>
+      </div>
+      <div class="section-title">极限位置与规则</div>
+      <div id="limit-info" class="info-box"></div>
+      <div class="section-title">选点检查</div>
+      <div id="vertex-check" class="info-box">
+        <span class="hint">点击场景中的顶点查看其规则、价数与极限位置策略。</span>
+      </div>
+    </aside>
+
+    <div id="status-bar">
+      <span id="status-text">就绪</span>
+      <span id="perf-text"></span>
+    </div>
+
+    <div id="tooltip" class="tooltip hidden"></div>
+  </div>
+
+  <script type="module" src="./src/app/main.js"></script>
+</body>
+</html>
